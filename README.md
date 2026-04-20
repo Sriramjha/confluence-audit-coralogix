@@ -20,8 +20,6 @@ git clone https://github.com/Sriramjha/confluence-audit-coralogix.git
 cd confluence-audit-coralogix
 ```
 
-*(After you create the GitHub repo — see [Publish to GitHub](#publish-to-github) below.)*
-
 ### 2. Python environment
 
 ```bash
@@ -81,34 +79,6 @@ Crontab (every 5 minutes):
 | `INTEGRATION_SEARCH_DIFF_IN_MINUTES` | Rolling window (good with frequent cron) |
 
 Full list: see the docstring at the top of `main.py`.
-
-## Publish to GitHub
-
-If this folder is only on your machine, create the remote repo and push:
-
-**Option A — GitHub website**
-
-1. Open [github.com/new](https://github.com/new), name the repository `confluence-audit-coralogix`, create it **without** a README.
-2. Then:
-
-```bash
-cd confluence-audit-coralogix
-git init
-git add .
-git commit -m "Initial commit: Confluence audit to Coralogix"
-git branch -M main
-git remote add origin https://github.com/Sriramjha/confluence-audit-coralogix.git
-git push -u origin main
-```
-
-**Option B — GitHub CLI**
-
-```bash
-gh auth login
-cd confluence-audit-coralogix
-git init && git add . && git commit -m "Initial commit: Confluence audit to Coralogix"
-gh repo create Sriramjha/confluence-audit-coralogix --public --source=. --remote=origin --push
-```
 
 ## References
 
