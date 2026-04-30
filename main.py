@@ -56,6 +56,11 @@ Optional:
   CONFLUENCE_MIN_INTERVAL_SEC  Sleep between Confluence pages (default 0)
   CORALOGIX_BATCH_SIZE      Logs per Coralogix POST (default 50)
   DEBUG                     If ``true``, print resolved settings (secrets redacted)
+
+CLI
+---
+  --diagnose                Print sites visible to the API token and probe ``GET .../user/current``
+                            (helps when audit worked before but now returns 403).
 """
 
 from __future__ import annotations
@@ -123,6 +128,121 @@ def _audit_url() -> str:
         )
         sys.exit(1)
     return f"https://{site}/wiki/rest/api/audit"
+
+
+def _confluence_rest_api_base(audit_url: str) -> str:
+    """``.../wiki/rest/api`` prefix for the configured site or gateway URL."""
+    suffix = "/audit"
+    if not audit_url.endswith(suffix):
+        raise RuntimeError(f"Unexpected audit URL shape: {audit_url!r}")
+    return audit_url[: -len(suffix)]
+
+
+ATLASSIAN_ACCESSIBLE_RESOURCES = "https://api.atlassian.com/oauth/token/accessible-resources"
+
+
+def diagnose_confluence_auth(
+    sess: requests.Session,
+    auth: HTTPBasicAuth,
+    *,
+    audit_url: str,
+    configured_cloud_id: str,
+    configured_site_host: str,
+) -> None:
+    """Print token-visible Atlassian sites and a lightweight Confluence REST probe."""
+    print("=== Sites visible to this API token (accessible-resources) ===", file=sys.stderr)
+    r = sess.get(
+        ATLASSIAN_ACCESSIBLE_RESOURCES,
+        auth=auth,
+        headers={"Accept": "application/json"},
+        timeout=120,
+    )
+    print(f"HTTP {r.status_code}", file=sys.stderr)
+    if r.status_code != 200:
+        print(r.text[:4000], file=sys.stderr)
+        print(
+            "\nIf this is 401: wrong email/token pair, revoked token, or typo in CONFLUENCE_EMAIL.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        resources = r.json()
+    except json.JSONDecodeError:
+        print(r.text[:4000], file=sys.stderr)
+        return
+
+    if not isinstance(resources, list):
+        print(json.dumps(resources, indent=2, default=str)[:8000], file=sys.stderr)
+        return
+
+    ids_urls: list[tuple[str, str]] = []
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        rid = item.get("id")
+        url = item.get("url")
+        name = item.get("name")
+        if isinstance(rid, str) and isinstance(url, str):
+            ids_urls.append((rid, url))
+            extra = f" ({name})" if isinstance(name, str) and name else ""
+            print(f"  cloudId={rid} url={url}{extra}", file=sys.stderr)
+
+    if configured_cloud_id:
+        match = any(rid == configured_cloud_id for rid, _ in ids_urls)
+        print(
+            f"\nConfigured CONFLUENCE_CLOUD_ID={configured_cloud_id!r} → "
+            f"{'listed above' if match else 'NOT in token site list — wrong cloud ID or token owner'}",
+            file=sys.stderr,
+        )
+    elif configured_site_host:
+        norm = configured_site_host.lower().rstrip("/")
+        match = any(
+            urlparse(u).hostname and urlparse(u).hostname.lower() == norm for _, u in ids_urls
+        )
+        print(
+            f"\nConfigured site host {configured_site_host!r} → "
+            f"{'matches a listed URL' if match else 'NOT in token site list — wrong BASE_URL/site or token owner'}",
+            file=sys.stderr,
+        )
+
+    base = _confluence_rest_api_base(audit_url)
+    probe = f"{base}/user/current"
+    print("\n=== Confluence REST probe (expect 200 if product access + permission) ===", file=sys.stderr)
+    print(f"GET {probe}", file=sys.stderr)
+    r2 = sess.get(probe, auth=auth, headers={"Accept": "application/json"}, timeout=120)
+    print(f"HTTP {r2.status_code}", file=sys.stderr)
+    print(r2.text[:4000], file=sys.stderr)
+    if r2.status_code == 403:
+        print(
+            "\n403 here matches audit 403: account lost Confluence on this site "
+            "(license, group, SCIM, admin removed product) or wrong site for this token.",
+            file=sys.stderr,
+        )
+
+
+def _audit_failure_message(status_code: int, text: str) -> str:
+    api_msg = ""
+    try:
+        j = json.loads(text)
+        if isinstance(j, dict) and isinstance(j.get("message"), str):
+            api_msg = j["message"]
+    except json.JSONDecodeError:
+        pass
+    base = f"Confluence audit failed {status_code}: {text}"
+    if status_code == 403 and (
+        "not permitted to use Confluence" in text or api_msg == "Current user not permitted to use Confluence"
+    ):
+        return (
+            f"{base}\n\n"
+            "Atlassian returned \"not permitted to use Confluence\": the authenticated account no longer has "
+            "Confluence product access on this site (common after license/group/SCIM changes), or BASE_URL / "
+            "CONFLUENCE_CLOUD_ID does not match the organization where this user has Confluence.\n"
+            "Verify the same user can open Confluence in the browser for this site; confirm "
+            "CONFLUENCE_EMAIL matches the API token owner.\n"
+            "Run: .venv/bin/python main.py --diagnose"
+        )
+    return base
 
 
 def _resolve_coralogix_domain() -> str:
@@ -288,7 +408,7 @@ def fetch_confluence_audit_page(
         wait = float(retry_after) if retry_after and retry_after.isdigit() else 60.0
         raise RuntimeError(f"Confluence rate limited (429); retry after ~{wait:.0f}s per Retry-After.")
     if r.status_code != 200:
-        raise RuntimeError(f"Confluence audit failed {r.status_code}: {r.text}")
+        raise RuntimeError(_audit_failure_message(r.status_code, r.text))
     body = r.json()
     if not isinstance(body, dict):
         raise RuntimeError(f"Unexpected Confluence JSON shape: {type(body).__name__}")
@@ -311,6 +431,11 @@ def main() -> None:
         action="store_true",
         help="Fetch and count records only; do not call Coralogix.",
     )
+    p.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Print sites visible to the token and probe GET .../wiki/rest/api/user/current; exit.",
+    )
     args = p.parse_args()
 
     email = (
@@ -328,6 +453,18 @@ def main() -> None:
 
     token = _require_env("CONFLUENCE_API_TOKEN")
     audit_url = _audit_url()
+
+    if args.diagnose:
+        auth = HTTPBasicAuth(email, token)
+        sess = requests.Session()
+        diagnose_confluence_auth(
+            sess,
+            auth,
+            audit_url=audit_url,
+            configured_cloud_id=os.environ.get("CONFLUENCE_CLOUD_ID", "").strip(),
+            configured_site_host=_confluence_site_hostname(),
+        )
+        return
 
     start_date, end_date = _resolve_audit_date_range(args_start=args.start_date, args_end=args.end_date)
 
