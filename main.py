@@ -20,6 +20,10 @@ Product selection (``ATLASSIAN_AUDIT_PRODUCT``):
 * Confluence path: **Confluence administrator**; scoped ``read:audit-log:confluence`` if using granular tokens.
 * Jira path: **Administer Jira** global permission; scoped ``read:audit-log:jira`` / ``manage:jira-configuration`` as per Atlassian docs.
 
+**Local env files:** variables already set in the process environment are never overwritten.
+If ``env.sh`` and/or ``.env`` exist in the **current working directory**, they are merged in that order;
+``ENV_FILE`` (optional path) is merged last so it wins on duplicate keys.
+
 Python
 ------
   python3 -m venv .venv
@@ -38,6 +42,7 @@ Required:
                             CORALOGIX_LOG_URL is set and the host can be parsed.
 
 Optional:
+  ENV_FILE                  Extra env file path merged after ``env.sh`` / ``.env`` (last wins on duplicates)
   ATLASSIAN_AUDIT_PRODUCT   confluence (default) | jira — which Cloud audit API to call
   CONFLUENCE_CLOUD_ID       Gateway: api.atlassian.com/ex/confluence/{id}/... (CONFLUENCE_SITE not needed)
   ATLASSIAN_CLOUD_ID        Same cloud UUID for gateway URLs if you prefer one variable (see JIRA_CLOUD_ID)
@@ -76,10 +81,87 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
+from pathlib import Path
+
 import requests
 from requests.auth import HTTPBasicAuth
 
 
+def _shell_env_key_ok(key: str) -> bool:
+    if not key:
+        return False
+    for i, ch in enumerate(key):
+        if i == 0:
+            if not (ch.isalpha() or ch == "_"):
+                return False
+        elif not (ch.isalnum() or ch == "_"):
+            return False
+    return True
+
+
+def _strip_shell_env_value(raw: str) -> str:
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        return s[1:-1]
+    return s
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip()
+        if not _shell_env_key_ok(key):
+            continue
+        out[key] = _strip_shell_env_value(rest)
+    return out
+
+
+def _bootstrap_env_files() -> None:
+    """Load ``env.sh``, ``.env``, then ``ENV_FILE`` without overriding OS env."""
+    cwd = Path.cwd()
+    paths: list[Path] = [cwd / "env.sh", cwd / ".env"]
+    extra = os.environ.get("ENV_FILE", "").strip()
+    if extra:
+        paths.append(Path(extra).expanduser())
+    merged: dict[str, str] = {}
+    for p in paths:
+        rp = p.expanduser()
+        try:
+            rp = rp.resolve()
+        except OSError:
+            continue
+        if rp.is_file():
+            merged.update(_parse_env_file(rp))
+    for key, val in merged.items():
+        existing = os.environ.get(key)
+        if existing is None:
+            os.environ[key] = val
+            continue
+        if isinstance(existing, str) and not existing.strip():
+            os.environ[key] = val
+
+
+def _http_error_body_hint(text: str) -> str:
+    """Avoid dumping HTML login pages into tracebacks."""
+    sample = text[:800].lower()
+    if "<html" in sample or "<!doctype html" in sample:
+        return (
+            "(HTML response omitted — invalid Atlassian Basic auth or SSO-only flow; "
+            "confirm email matches API token owner and token is valid.)"
+        )
+    return text
 def _require_env(name: str) -> str:
     v = os.environ.get(name, "").strip()
     if not v:
@@ -279,7 +361,7 @@ def diagnose_atlassian_auth(
     print(f"GET {probe}", file=sys.stderr)
     r2 = sess.get(probe, auth=auth, headers={"Accept": "application/json"}, timeout=120)
     print(f"HTTP {r2.status_code}", file=sys.stderr)
-    print(r2.text[:4000], file=sys.stderr)
+    print(_http_error_body_hint(r2.text)[:4000], file=sys.stderr)
     if r2.status_code == 403:
         if product == "confluence":
             print(
@@ -295,6 +377,7 @@ def diagnose_atlassian_auth(
 
 
 def _audit_failure_message(status_code: int, text: str, *, product: str) -> str:
+    text = _http_error_body_hint(text)
     api_msg = ""
     try:
         j = json.loads(text)
@@ -321,6 +404,14 @@ def _audit_failure_message(status_code: int, text: str, *, product: str) -> str:
         return (
             f"{base}\n\n"
             "Jira audit requires Administer Jira global permission (and API scopes per Atlassian docs).\n"
+            "Run: .venv/bin/python main.py --diagnose"
+        )
+    if status_code == 401:
+        return (
+            f"{base}\n\n"
+            "HTTP 401: Atlassian rejected Basic auth. Regenerate an API token for this exact email "
+            "at https://id.atlassian.com/manage-profile/security/api-tokens — scoped/org tokens must "
+            "allow Jira or Confluence REST as documented.\n"
             "Run: .venv/bin/python main.py --diagnose"
         )
     return base
@@ -580,6 +671,7 @@ def fetch_jira_audit_page(
 
 
 def main() -> None:
+    _bootstrap_env_files()
     p = argparse.ArgumentParser(
         description="Ship Atlassian Cloud (Confluence or Jira) audit records to Coralogix.",
     )

@@ -60,6 +60,8 @@ cp env.example env.sh
 chmod 600 env.sh
 ```
 
+From the directory that contains **`env.sh`** and/or **`.env`**, **`main.py` loads them automatically** when it starts (merge order: `env.sh`, then `.env`, then **`ENV_FILE`** if set). Variables already set in the process environment with a **non-empty** value are kept; **empty** values are replaced from files.
+
 Edit **`env.sh`** with real values. Minimum:
 
 | Variable | Purpose |
