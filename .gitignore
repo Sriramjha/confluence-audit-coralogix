@@ -6,3 +6,6 @@ __pycache__/
 env.sh
 *.log
 .DS_Store
+
+# Nested clone used to test pulls from GitHub (see integration-test/README.txt)
+integration-test/confluence-audit-coralogix/
