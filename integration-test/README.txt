@@ -12,6 +12,7 @@ Setup inside the clone:
   cp env.example env.sh
   # edit env.sh with real secrets, chmod 600 env.sh
   source env.sh
+  # Jira-only site (no Confluence): export ATLASSIAN_AUDIT_PRODUCT=jira in env.sh
   .venv/bin/python main.py --diagnose   # optional
   .venv/bin/python main.py --dry-run
 
